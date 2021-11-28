@@ -1,5 +1,5 @@
 use probe_rs::Probe;
-use probe_rs_rtt::{Rtt, UpChannel};
+use probe_rs_rtt::{Rtt, UpChannel, ScanRegion};
 use serde::Deserialize;
 use std::fs;
 use std::io::prelude::*;
@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use structopt::StructOpt;
-use tracing::{debug, info, trace};
+use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -25,11 +25,18 @@ pub struct Args {
     /// A toml file specifying the configuration
     #[structopt(short, long)]
     config: Option<PathBuf>,
+    /// Resets the chip on attach
+    #[structopt(short, long)]
+    reset: bool,
+    /// For instances where the RTT address cannot be found the binary may need to be searched for
+    /// the localtion
+    #[structopt(long)]
+    binary: Option<PathBuf>
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
-    #[serde(rename = "default.rtt_file")]
+    #[serde(rename = "rtt_file")]
     rtt_config: RttConfig,
 }
 
@@ -65,6 +72,25 @@ fn setup_tracing() {
         .init();
 }
 
+/// Taken from https://github.com/probe-rs/cargo-embed/blob/master/src/rttui/app.rs at 9819f6d
+pub fn get_rtt_symbol<T: Read + Seek>(file: &mut T) -> Option<u64> {
+    let mut buffer = Vec::new();
+    if file.read_to_end(&mut buffer).is_ok() {
+        if let Ok(binary) = goblin::elf::Elf::parse(buffer.as_slice()) {
+            for sym in &binary.syms {
+                if let Some(name) = binary.strtab.get_at(sym.st_name) {
+                    if name == "_SEGGER_RTT" {
+                        return Some(sym.st_value);
+                    }
+                }
+            }
+        }
+    }
+
+    warn!("No RTT header info was present in the ELF file. Does your firmware run RTT?");
+    None
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     setup_tracing();
 
@@ -72,14 +98,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Getting probe: {}", args.probe);
     let probe = Probe::list_all()[args.probe].open()?;
     info!("Attaching to chip: {}", args.chip);
-    let mut session = probe.attach(&args.chip)?;
+    let mut session = if args.reset {
+        probe.attach_under_reset(&args.chip)?
+    } else {
+        probe.attach(&args.chip)?
+    };
     let memory_map = session.target().memory_map.clone();
+
+    debug!("Memory map: {:?}", memory_map);
 
     info!("Getting core: {}", args.core);
     let mut core = session.core(args.core)?;
 
     info!("Attaching via RTT");
-    let mut rtt = Rtt::attach(&mut core, &memory_map)?;
+    let rtt = Rtt::attach(&mut core, &memory_map);
+
+    let mut rtt = match (rtt, args.binary.as_ref()) {
+        (Ok(r), _) => r,
+        (Err(_), Some(bin))  => {
+            warn!("Failed to attach to RTT");
+            info!("attempting to find sections in '{}' and connect", bin.display());
+            let mut file = fs::File::open(bin)?;
+            if let Some(addr) = get_rtt_symbol(&mut file) {
+                Rtt::attach_region(&mut core, &memory_map, &ScanRegion::Exact(addr as u32))?
+            } else {
+                panic!("Unable to attach RTT");
+            }
+        }
+        (Err(e), None) => {
+            error!("Failed to connect");
+            panic!("{}", e);
+        }
+    };
 
     // Get channels dump to file
     let config_file = args.config.unwrap_or(PathBuf::from("Embed.toml"));
@@ -113,7 +163,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let r = running.clone();
 
     ctrlc::set_handler(move || {
-        info!("Closing down dumper");
+        info!("Received close signal");
         r.store(false, Ordering::SeqCst);
     })
     .expect("Error setting Ctrl-C handler");
