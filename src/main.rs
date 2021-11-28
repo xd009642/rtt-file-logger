@@ -1,5 +1,5 @@
 use probe_rs::Probe;
-use probe_rs_rtt::{Rtt, UpChannel, ScanRegion};
+use probe_rs_rtt::{Rtt, ScanRegion, UpChannel};
 use serde::Deserialize;
 use std::fs;
 use std::io::prelude::*;
@@ -31,7 +31,7 @@ pub struct Args {
     /// For instances where the RTT address cannot be found the binary may need to be searched for
     /// the localtion
     #[structopt(long)]
-    binary: Option<PathBuf>
+    binary: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -115,9 +115,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut rtt = match (rtt, args.binary.as_ref()) {
         (Ok(r), _) => r,
-        (Err(_), Some(bin))  => {
+        (Err(_), Some(bin)) => {
             warn!("Failed to attach to RTT");
-            info!("attempting to find sections in '{}' and connect", bin.display());
+            info!(
+                "attempting to find sections in '{}' and connect",
+                bin.display()
+            );
             let mut file = fs::File::open(bin)?;
             if let Some(addr) = get_rtt_symbol(&mut file) {
                 Rtt::attach_region(&mut core, &memory_map, &ScanRegion::Exact(addr as u32))?
@@ -168,25 +171,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
     .expect("Error setting Ctrl-C handler");
 
+    let mut sequential_zeros = 0;
     while running.load(Ordering::SeqCst) {
         // To do move this into some sort of poll function
         for sink in &mut sinks {
             if !sink.working {
+                trace!("Sink {} broken. Skipping", sink.name);
                 continue;
             }
             let res = sink.channel.read(&mut core, &mut buffer[..]);
             match res {
                 Ok(bytes) if bytes > 0 => {
                     trace!("Received data writing {} bytes from {}", bytes, sink.name);
+                    sequential_zeros = 0;
                     if let Err(e) = sink.file.write_all(&buffer[..bytes]) {
-                        println!("Failed to write data from {}: {}", sink.name, e);
+                        error!("Failed to write data from {}: {}", sink.name, e);
                         sink.working = false;
                     }
                 }
                 Err(e) => {
-                    println!("Channel error: {}", e);
+                    sequential_zeros = 0;
+                    error!("Channel error: {}", e);
                 }
-                Ok(_) => {}
+                Ok(_) => {
+                    sequential_zeros += 1;
+                    if sequential_zeros % 100 == 1 {
+                        trace!("0 byte read #{}", sequential_zeros);
+                    }
+                }
             }
         }
     }
