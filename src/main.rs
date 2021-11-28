@@ -95,6 +95,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     setup_tracing();
 
     let args = Args::from_args();
+    // Get channels dump to file
+    let config_file = args.config.unwrap_or(PathBuf::from("Embed.toml"));
+
+    info!("Reading configuration file");
+    let config_toml = fs::read_to_string(config_file)?;
+    let config: Config = toml::from_str(&config_toml)?;
+
     info!("Getting probe: {}", args.probe);
     let probe = Probe::list_all()[args.probe].open()?;
     info!("Attaching to chip: {}", args.chip);
@@ -133,15 +140,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             panic!("{}", e);
         }
     };
-
-    // Get channels dump to file
-    let config_file = args.config.unwrap_or(PathBuf::from("Embed.toml"));
-
-    info!("Reading configuration file");
-    let config_toml = fs::read_to_string(config_file)?;
-
-    info!("Deserializing config");
-    let config: Config = toml::from_str(&config_toml)?;
 
     let mut sinks: Vec<ChannelSink> = config
         .rtt_config
